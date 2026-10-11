@@ -507,13 +507,39 @@ async function getSession(key) {
   setStatus(`${name} 모델 준비 중…`); setProgress(null);
   // UltraSharp은 WebGPU 기본(NHWC) 레이아웃에서 마지막 Conv가 실패함 → NCHW로 실행
   const gpu = MODELS[key].layout ? { name: 'webgpu', preferredLayout: MODELS[key].layout } : 'webgpu';
-  const eps = state.backend.ep === 'webgpu' ? [gpu, 'wasm'] : ['wasm'];
-  const session = await ort.InferenceSession.create(bytes, {
-    executionProviders: eps,
-    graphOptimizationLevel: 'all',
-  });
+  let session = null;
+  if (state.backend.ep === 'webgpu') {
+    // GPU 준비가 멈추는 기기(일부 아이폰 등)가 있어서, 제한 시간 안에 안 되면 CPU로 전환
+    try {
+      session = await withTimeout(ort.InferenceSession.create(bytes, {
+        executionProviders: [gpu, 'wasm'], graphOptimizationLevel: 'all',
+      }), 25000, 'GPU 준비 시간 초과');
+    } catch (e) {
+      console.warn('GPU 실패, CPU로 전환:', e);
+      setStatus(`GPU를 쓸 수 없어 CPU로 전환합니다… (${e.message || e})`, 'err');
+      state.backend = { ep: 'wasm', label: 'CPU (WebAssembly) — GPU 준비 실패로 전환' };
+      $('gpuText').textContent = 'CPU 모드 (GPU 실패)';
+      $('gpuBadge').classList.remove('gpu');
+      $('env').textContent = '실행 환경: ' + state.backend.label;
+      state.sessions = {}; // 이미 만든 GPU 세션은 버리고 CPU로 다시
+    }
+  }
+  if (!session) {
+    setStatus(`${name} 모델 준비 중 (CPU)…`);
+    session = await withTimeout(ort.InferenceSession.create(bytes, {
+      executionProviders: ['wasm'], graphOptimizationLevel: 'all',
+    }), 120000, 'CPU 준비 시간 초과');
+  }
   state.sessions[key] = session;
   return session;
+}
+
+function withTimeout(promise, ms, msg) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); }),
+  ]).finally(() => clearTimeout(t));
 }
 
 // ---------- 타일 단위 추론 ----------
